@@ -436,6 +436,9 @@ class v8DetectionLoss:
         bce_loss = self.bce(pred_scores, target_scores.to(dtype))  # (bs, num_anchors, nc)
         if self.class_weights is not None:
             bce_loss *= self.class_weights
+        text_mask = batch.get("text_mask")
+        if text_mask is not None:
+            bce_loss *= text_mask[:, None]
         loss[1] = bce_loss.sum() / target_scores_sum  # BCE
 
         # Bbox loss

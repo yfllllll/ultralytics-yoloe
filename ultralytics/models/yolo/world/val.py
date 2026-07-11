@@ -14,12 +14,12 @@ class WorldValidator(DetectionValidator):
 
     Open-vocabulary YOLO-World models default to 80 COCO classes, so validating on a dataset with different classes
     (e.g. LVIS) fails or yields zero metrics. This validator generates text embeddings for the dataset's class names so
-    standalone `model.val()` works. During training, classes are set via the `on_pretrain_routine_end` callback instead.
+    standalone and training-time validation both use the active dataset vocabulary.
     """
 
     def __call__(self, trainer=None, model=None):
-        """Set dataset classes for standalone validation, then run validation."""
-        if trainer is None:  # standalone val; training sets classes via on_pretrain_routine_end callback
+        """Set the current dataset classes for training or standalone validation."""
+        if trainer is None:
             self.device = select_device(self.args.device, verbose=False)
             if not isinstance(model, torch.nn.Module):
                 from ultralytics.nn.tasks import load_checkpoint
@@ -28,13 +28,21 @@ class WorldValidator(DetectionValidator):
             model.eval().to(self.device)
             self.args.data = convert_ndjson_to_yolo_if_needed(self.args.data)  # match BaseValidator dataset handling
             names = [name.split("/", 1)[0] for name in check_det_dataset(self.args.data)["names"].values()]
-            current = model.names.values() if isinstance(model.names, dict) else model.names  # names may be a list
-            if list(current) != names:  # regenerate prompts only if class order differs from dataset
-                state = (model.names, model.txt_feats, model.model[-1].nc)  # restore after to avoid leak to caller
-                model.set_classes(names, cache_clip_model=False)
-                model.names = dict(enumerate(names))  # set_classes updates embeddings/nc but not names
-                try:
-                    return super().__call__(trainer, model)
-                finally:
-                    model.names, model.txt_feats, model.model[-1].nc = state
-        return super().__call__(trainer, model)
+        else:
+            model = trainer.ema.ema
+            names = [name.split("/", 1)[0] for name in self.dataloader.dataset.data["names"].values()]
+
+        state = (model.names, model.txt_feats, model.model[-1].nc)
+        had_criterion, criterion = hasattr(model, "criterion"), getattr(model, "criterion", None)
+        model.set_classes(names, cache_clip_model=False)
+        model.names = dict(enumerate(names))  # set_classes updates embeddings/nc but not names
+        if had_criterion:
+            del model.criterion  # validation datasets can have different class counts
+        try:
+            return super().__call__(trainer, model)
+        finally:
+            model.names, model.txt_feats, model.model[-1].nc = state
+            if had_criterion:
+                model.criterion = criterion
+            elif hasattr(model, "criterion"):
+                del model.criterion

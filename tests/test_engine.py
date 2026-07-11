@@ -414,3 +414,161 @@ def test_setup_model_respects_pretrained_arg_for_pt_models(monkeypatch, pretrain
 
     assert captured["cfg"] == checkpoint_model.yaml, "Checkpoint config was not used"
     assert captured["weights"] is (checkpoint_model if uses_weights else None), "Unexpected weights loaded"
+
+
+def test_world_trainer_pads_per_dataset_texts_without_mixing_boundaries():
+    """Pad heterogeneous local vocabularies while preserving each image's text features and supervision mask."""
+    from ultralytics.models.yolo.world.train import WorldTrainer
+
+    trainer = object.__new__(WorldTrainer)
+    trainer.args = SimpleNamespace(multi_scale=0.0)
+    trainer.device = torch.device("cpu")
+    trainer.model = SimpleNamespace(model=[SimpleNamespace(nc=4)])
+    trainer.text_embeddings = {name: torch.full((3,), value) for value, name in enumerate("abcdef", 1)}
+    batch = {
+        "img": torch.zeros(2, 3, 8, 8, dtype=torch.uint8),
+        "texts": (["a", "b"], ["c", "d", "e", "f"]),
+    }
+
+    batch = trainer.preprocess_batch(batch)
+
+    assert batch["txt_feats"].shape == (2, 4, 3)
+    assert torch.equal(batch["txt_feats"][0, :2], torch.stack([trainer.text_embeddings[x] for x in "ab"]))
+    assert torch.equal(batch["txt_feats"][1], torch.stack([trainer.text_embeddings[x] for x in "cdef"]))
+    assert not batch["txt_feats"][0, 2:].any()
+    assert torch.equal(batch["text_mask"], torch.tensor([[True, True, False, False], [True, True, True, True]]))
+
+
+def test_yoloe_model_preserves_configured_prompt_capacity():
+    """Keep the configured prompt count during the dummy forward used to initialize model strides."""
+    from ultralytics.nn.tasks import YOLOEModel
+
+    model = YOLOEModel("ultralytics/cfg/models/11/yoloe-11.yaml", nc=5, verbose=False)
+
+    assert model.model[-1].nc == 5
+
+
+def test_world_trainer_applies_shared_text_limit_to_yolo_datasets(monkeypatch):
+    """Apply the training/model text capacity to every YOLO child dataset without merging their vocabularies."""
+    from ultralytics.models.yolo.world import train_world
+
+    max_samples = []
+
+    def build_dataset(*args, **kwargs):
+        max_samples.append(kwargs["max_samples"])
+        return torch.utils.data.TensorDataset(torch.zeros(1))
+
+    trainer = object.__new__(train_world.WorldTrainerFromScratch)
+    trainer.args = SimpleNamespace()
+    trainer.data = {"max_text_samples": 5}
+    trainer.model = SimpleNamespace(stride=torch.tensor([32]))
+    trainer.training_data = {"small": {}, "large": {}}
+    trainer.set_text_embeddings = lambda datasets, batch: None
+    monkeypatch.setattr(train_world, "build_yolo_dataset", build_dataset)
+
+    dataset = trainer.build_dataset(["small", "large"], batch=2)
+
+    assert len(dataset.datasets) == 2
+    assert max_samples == [5, 5]
+
+
+@pytest.mark.parametrize("single_cls,expected_max", [(False, 5), (True, 1)])
+def test_world_trainer_supports_multiple_validation_datasets(monkeypatch, single_cls, expected_max):
+    """Derive prompt capacity from training data and retain independent validation metadata."""
+    from ultralytics.models.yolo.world import train_world
+
+    datasets = {
+        "train-one.yaml": {"train": "train-one", "val": "unused", "nc": 1},
+        "train-five.yaml": {"train": "train-five", "val": "unused", "nc": 5},
+        "val-two.yaml": {"train": "unused", "val": "val-two", "nc": 2},
+        "val-seven.yaml": {"train": "unused", "val": "val-seven", "nc": 7},
+    }
+    for data in datasets.values():
+        data.update(names=dict(enumerate(f"class-{i}" for i in range(data["nc"]))), path=Path(), channels=3)
+
+    trainer = object.__new__(train_world.WorldTrainerFromScratch)
+    trainer.args = SimpleNamespace(
+        data={
+            "train": {"yolo_data": ["train-one.yaml", "train-five.yaml"]},
+            "val": {"yolo_data": ["val-two.yaml", "val-seven.yaml"]},
+        },
+        single_cls=single_cls,
+    )
+    monkeypatch.setattr(train_world, "check_det_dataset", lambda source: datasets[source].copy())
+
+    data = trainer.get_dataset()
+
+    assert data["max_text_samples"] == expected_max
+    assert data["val"] == "val-two"
+    assert len(trainer.validation_sets) == 2
+    assert [x["path"] for x in trainer.validation_sets] == ["val-two", "val-seven"]
+    assert [x["data"]["nc"] for x in trainer.validation_sets] == ([1, 1] if single_cls else [2, 7])
+
+
+def test_world_trainer_aggregates_multiple_validation_metrics():
+    """Keep primary metric names, prefix secondary metrics, and average dataset fitness equally."""
+    from ultralytics.models.yolo.world.train_world import WorldTrainerFromScratch
+
+    class Validator:
+        def __init__(self):
+            self.args = SimpleNamespace(data="original", split="val")
+            self.dataloader = "primary-loader"
+
+        def __call__(self, trainer):
+            return {"metrics/mAP50-95(B)": trainer.data["score"], "fitness": trainer.data["score"]}
+
+    trainer = object.__new__(WorldTrainerFromScratch)
+    trainer.data = {"original": True}
+    trainer.validation_sets = [
+        {"name": "primary", "source": "primary.yaml", "split": "val", "data": {"score": 0.2}},
+        {"name": "secondary", "source": "secondary.yaml", "split": "val", "data": {"score": 0.8}},
+    ]
+    trainer.test_loaders = ["primary-loader", "secondary-loader"]
+    trainer.validator = Validator()
+    trainer.ema = None
+    trainer.world_size = 1
+    trainer.loss = torch.tensor(1.0)
+    trainer.best_fitness = 0.0
+
+    metrics, fitness = trainer.validate()
+
+    assert metrics == {"metrics/mAP50-95(B)": 0.2, "secondary/metrics/mAP50-95(B)": 0.8}
+    assert fitness == 0.5
+    assert trainer.data == {"original": True}
+    assert trainer.validator.dataloader == "primary-loader"
+
+
+def test_detection_loss_ignores_masked_text_slots():
+    """Ensure padded text slots cannot suppress classes absent from a child dataset's vocabulary."""
+    from ultralytics.utils.loss import v8DetectionLoss
+
+    class Head(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.nc = 4
+            self.reg_max = 1
+            self.stride = torch.tensor([8.0])
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros(1))
+            self.args = SimpleNamespace(box=1.0, cls=1.0, dfl=1.0)
+            self.model = torch.nn.ModuleList([Head()])
+
+    criterion = v8DetectionLoss(Model())
+    preds = {
+        "boxes": torch.zeros(2, 4, 1),
+        "scores": torch.zeros(2, 4, 1),
+        "feats": [torch.zeros(2, 1, 1, 1)],
+    }
+    batch = {
+        "batch_idx": torch.empty(0),
+        "cls": torch.empty(0),
+        "bboxes": torch.empty(0, 4),
+        "text_mask": torch.tensor([[True, True, False, False], [True, True, True, True]]),
+    }
+    base_loss = criterion.loss(preds, batch)[0]
+    preds["scores"][0, 2:] = 20  # masked logits must not alter the classification loss
+
+    assert torch.equal(criterion.loss(preds, batch)[0], base_loss)
