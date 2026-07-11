@@ -167,6 +167,8 @@ class YOLOEDetectValidator(DetectionValidator):
                 LOGGER.info("Validate using the text prompt.")
                 tpe = model.get_text_pe(names)
                 model.set_classes(names, tpe)
+            if hasattr(model, "criterion"):
+                del model.criterion  # validation datasets can have different class counts
             stats = super().__call__(trainer, model)
         else:
             if refer_data is not None:

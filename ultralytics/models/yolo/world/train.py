@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import itertools
+from copy import copy
 from pathlib import Path
 from typing import Any
 
@@ -14,12 +14,7 @@ from ultralytics.nn.tasks import WorldModel
 from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK
 from ultralytics.utils.torch_utils import unwrap_model
 
-
-def on_pretrain_routine_end(trainer) -> None:
-    """Set up model classes and text encoder at the end of the pretrain routine."""
-    # Set on all ranks: validation runs on every rank, but txt_feats/nc are not DDP buffers so they don't sync
-    names = [name.split("/", 1)[0] for name in list(trainer.test_loader.dataset.data["names"].values())]
-    unwrap_model(trainer.ema.ema).set_classes(names, cache_clip_model=False)
+from .val import WorldValidator
 
 
 class WorldTrainer(DetectionTrainer):
@@ -76,19 +71,22 @@ class WorldTrainer(DetectionTrainer):
         Returns:
             (WorldModel): Initialized WorldModel.
         """
-        # NOTE: This `nc` here is the max number of different text samples in one image, rather than the actual `nc`.
-        # NOTE: Following the official config, nc hard-coded to 80 for now.
+        # `nc` is the shared text capacity for a training image, not a dataset's class count.
         model = WorldModel(
             cfg["yaml_file"] if isinstance(cfg, dict) else cfg,
             ch=self.data["channels"],
-            nc=min(self.data["nc"], 80),
+            nc=self.data.get("max_text_samples", min(self.data["nc"], 80)),
             verbose=verbose and RANK == -1,
         )
         if weights:
             model.load(weights)
-        self.add_callback("on_pretrain_routine_end", on_pretrain_routine_end)
 
         return model
+
+    def get_validator(self):
+        """Return a validator that sets the active dataset vocabulary before evaluation."""
+        self.loss_names = "box_loss", "cls_loss", "dfl_loss"
+        return WorldValidator(self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks)
 
     def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None):
         """Build YOLO Dataset for training or validation.
@@ -163,10 +161,15 @@ class WorldTrainer(DetectionTrainer):
         """Preprocess a batch of images and text for YOLOWorld training."""
         batch = DetectionTrainer.preprocess_batch(self, batch)
 
-        # Add text features
-        texts = list(itertools.chain(*batch["texts"]))
-        txt_feats = torch.stack([self.text_embeddings[text] for text in texts]).to(
-            self.device, non_blocking=self.device.type == "cuda"
-        )
-        batch["txt_feats"] = txt_feats.reshape(len(batch["texts"]), -1, txt_feats.shape[-1])
+        # Add per-image text features, masking unused slots without sharing negatives across datasets
+        max_samples = unwrap_model(self.model).model[-1].nc
+        prototype = next(iter(self.text_embeddings.values()))
+        txt_feats = prototype.new_zeros(len(batch["texts"]), max_samples, prototype.shape[-1])
+        text_mask = torch.zeros(txt_feats.shape[:2], dtype=torch.bool, device=txt_feats.device)
+        for i, texts in enumerate(batch["texts"]):
+            n = len(texts)
+            txt_feats[i, :n] = torch.stack([self.text_embeddings[text] for text in texts])
+            text_mask[i, :n] = True
+        batch["txt_feats"] = txt_feats.to(self.device, non_blocking=self.device.type == "cuda")
+        batch["text_mask"] = text_mask.to(self.device, non_blocking=self.device.type == "cuda")
         return batch

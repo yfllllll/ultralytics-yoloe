@@ -335,15 +335,17 @@ class YOLOMultiModalDataset(YOLODataset):
         >>> print(batch.keys())  # Should include 'texts'
     """
 
-    def __init__(self, *args, data: dict | None = None, task: str = "detect", **kwargs):
+    def __init__(self, *args, data: dict | None = None, task: str = "detect", max_samples: int | None = None, **kwargs):
         """Initialize a YOLOMultiModalDataset.
 
         Args:
             data (dict, optional): Dataset configuration dictionary.
             task (str): Task type, one of 'detect', 'segment', 'pose', or 'obb'.
+            max_samples (int, optional): Shared upper bound for text samples per image.
             *args (Any): Additional positional arguments for the parent class.
             **kwargs (Any): Additional keyword arguments for the parent class.
         """
+        self.max_samples = max_samples
         super().__init__(*args, data=data, task=task, **kwargs)
 
     def update_labels_info(self, label: dict) -> dict:
@@ -378,7 +380,7 @@ class YOLOMultiModalDataset(YOLODataset):
             # the strategy of selecting negative is restricted in one dataset,
             # while official pre-saved neg embeddings from all datasets at once.
             transform = RandomLoadText(
-                max_samples=min(self.data["nc"], 80),
+                max_samples=min(self.data["nc"], self.max_samples if self.max_samples is not None else 80, 80),
                 padding=True,
                 padding_value=self._get_neg_texts(self.category_freq),
             )

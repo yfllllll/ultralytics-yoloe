@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ultralytics.data import YOLOConcatDataset, build_grounding, build_yolo_dataset
+import torch.distributed as dist
+
+from ultralytics.data import YOLOConcatDataset, build_dataloader, build_grounding, build_yolo_dataset
 from ultralytics.data.utils import check_det_dataset
 from ultralytics.models.yolo.world import WorldTrainer
-from ultralytics.utils import DATASETS_DIR, DEFAULT_CFG, LOGGER
+from ultralytics.utils import DATASETS_DIR, DEFAULT_CFG, LOCAL_RANK, LOGGER
 from ultralytics.utils.checks import check_file
 from ultralytics.utils.torch_utils import unwrap_model
 
@@ -87,16 +89,24 @@ class WorldTrainerFromScratch(WorldTrainer):
         if mode != "train":
             return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, rect=False, stride=gs)
         datasets = [
-            build_yolo_dataset(self.args, im_path, batch, self.training_data[im_path], stride=gs, multi_modal=True)
+            build_yolo_dataset(
+                self.args,
+                im_path,
+                batch,
+                self.training_data[im_path],
+                stride=gs,
+                multi_modal=True,
+                max_samples=self.data["max_text_samples"],
+            )
             if isinstance(im_path, str)
             else build_grounding(
-                # assign `nc` from validation set to max number of text samples for training consistency
+                # Use the same text capacity for YOLO and grounding datasets.
                 self.args,
                 im_path["img_path"],
                 im_path["json_file"],
                 batch,
                 stride=gs,
-                max_samples=self.data["nc"],
+                max_samples=self.data["max_text_samples"],
             )
             for im_path in img_path
         ]
@@ -130,68 +140,161 @@ class WorldTrainerFromScratch(WorldTrainer):
             (dict): Final processed data configuration containing train/val paths and metadata.
 
         Raises:
-            AssertionError: If train or validation datasets are not found, or if validation has multiple datasets.
+            AssertionError: If train or validation datasets are not found.
         """
-        final_data = {}
         self.args.data = data_yaml = self.check_data_config(self.args.data)
         assert data_yaml.get("train", False), "train dataset not found"  # object365.yaml
         assert data_yaml.get("val", False), "validation dataset not found"  # lvis.yaml
-        data = {k: [check_det_dataset(d) for d in v.get("yolo_data", [])] for k, v in data_yaml.items()}
-        assert len(data["val"]) == 1, f"Only support validating on 1 dataset for now, but got {len(data['val'])}."
-        val_split = "minival" if "lvis" in data["val"][0]["val"] else "val"
-        for d in data["val"]:
-            if d.get("minival") is None:  # for lvis dataset
-                continue
-            d["minival"] = str(d["path"] / d["minival"])
-        for s in {"train", "val"}:
-            final_data[s] = [d["train" if s == "train" else val_split] for d in data[s]]
-            # save grounding data if there's one
-            grounding_data = data_yaml[s].get("grounding_data")
-            if grounding_data is None:
-                continue
-            grounding_data = grounding_data if isinstance(grounding_data, list) else [grounding_data]
-            for g in grounding_data:
-                assert isinstance(g, dict), f"Grounding data should be provided in dict format, but got {type(g)}"
-                for k in {"img_path", "json_file"}:
-                    path = Path(g[k])
-                    if not path.exists() and not path.is_absolute():
-                        g[k] = str((DATASETS_DIR / g[k]).resolve())  # path relative to DATASETS_DIR
-            final_data[s] += grounding_data
-        # assign the first val dataset as currently only one validation set is supported
-        data["val"] = data["val"][0]
-        final_data["val"] = final_data["val"][0]
-        # NOTE: to make training work properly, set `nc` and `names`
-        final_data["nc"] = data["val"]["nc"]
-        final_data["names"] = data["val"]["names"]
-        # NOTE: add path with lvis path
-        final_data["path"] = data["val"]["path"]
-        final_data["channels"] = data["val"]["channels"]
-        self.data = final_data
-        if self.args.single_cls:  # consistent with base trainer
+        train_sources = data_yaml["train"].get("yolo_data", [])
+        train_sources = train_sources if isinstance(train_sources, (list, tuple)) else [train_sources]
+        val_sources = data_yaml["val"].get("yolo_data", [])
+        val_sources = val_sources if isinstance(val_sources, (list, tuple)) else [val_sources]
+        train_data = [check_det_dataset(source) for source in train_sources]
+        val_data = [check_det_dataset(source) for source in val_sources]
+        assert val_data, "validation yolo dataset not found"
+
+        grounding_data = data_yaml["train"].get("grounding_data") or []
+        grounding_data = grounding_data if isinstance(grounding_data, list) else [grounding_data]
+        assert train_data or grounding_data, "training dataset not found"
+        for g in grounding_data:
+            assert isinstance(g, dict), f"Grounding data should be provided in dict format, but got {type(g)}"
+            for k in {"img_path", "json_file"}:
+                path = Path(g[k])
+                if not path.exists() and not path.is_absolute():
+                    g[k] = str((DATASETS_DIR / path).resolve())
+
+        if self.args.single_cls:
             LOGGER.info("Overriding class names with single class.")
-            self.data["names"] = {0: "object"}
-            self.data["nc"] = 1
-        self.training_data = {}
-        for d in data["train"]:
-            if self.args.single_cls:
+            for d in [*train_data, *val_data]:
                 d["names"] = {0: "object"}
                 d["nc"] = 1
+
+        self.validation_sets = []
+        used_names = set()
+        for i, (source, d) in enumerate(zip(val_sources, val_data)):
+            if d.get("minival") is not None:
+                d["minival"] = str(d["path"] / d["minival"])
+            split = "minival" if "lvis" in str(d.get("val", "")) and d.get("minival") else "val"
+            name = Path(str(source)).stem or f"val{i + 1}"
+            if name in used_names:
+                name = f"{name}-{i + 1}"
+            used_names.add(name)
+            self.validation_sets.append({"name": name, "source": source, "split": split, "path": d[split], "data": d})
+
+        primary_val = self.validation_sets[0]
+        max_text_samples = (
+            1 if self.args.single_cls else 80 if grounding_data else min(max(d["nc"] for d in train_data), 80)
+        )
+        final_data = {
+            "train": [d["train"] for d in train_data] + grounding_data,
+            "val": primary_val["path"],
+            "nc": primary_val["data"]["nc"],
+            "names": primary_val["data"]["names"],
+            "path": primary_val["data"]["path"],
+            "channels": primary_val["data"]["channels"],
+            "max_text_samples": max_text_samples,
+        }
+        self.data = final_data
+        self.training_data = {}
+        for d in train_data:
             self.training_data[d["train"]] = d
         return final_data
+
+    def _build_train_pipeline(self):
+        """Build the training loader and one validation loader per validation dataset."""
+        super()._build_train_pipeline()
+        self.test_loaders = [self.test_loader]
+        if getattr(self, "validator", None) is not None:  # refresh after automatic OOM batch-size reduction
+            self.validator.dataloader = self.test_loader
+        if len(self.validation_sets) == 1:
+            return
+
+        batch_size = self.batch_size // max(self.world_size, 1)
+        val_batch = batch_size if self.args.task in {"obb", "semantic"} else batch_size * 2
+        gs = max(int(unwrap_model(self.model).stride.max()), 32)
+        for val_set in self.validation_sets[1:]:
+            dataset = build_yolo_dataset(
+                self.args,
+                val_set["path"],
+                val_batch,
+                val_set["data"],
+                mode="val",
+                rect=False,
+                stride=gs,
+            )
+            self.test_loaders.append(
+                build_dataloader(
+                    dataset,
+                    batch=val_batch,
+                    workers=self.args.workers * 2,
+                    shuffle=False,
+                    rank=LOCAL_RANK,
+                )
+            )
+
+    def validate(self):
+        """Validate each dataset with its own vocabulary and average their fitness scores."""
+        if len(self.validation_sets) == 1:
+            return super().validate()
+        if self.ema and self.world_size > 1:
+            for buffer in self.ema.ema.buffers():
+                dist.broadcast(buffer, src=0)
+
+        original_data = self.data
+        original_loader = self.validator.dataloader
+        original_args = (self.validator.args.data, self.validator.args.split)
+        metrics, fitness = {}, []
+        try:
+            # Run the primary dataset last so checkpoints retain its vocabulary and metric names.
+            for i in [*range(1, len(self.validation_sets)), 0]:
+                val_set = self.validation_sets[i]
+                self.data = val_set["data"]
+                self.validator.dataloader = self.test_loaders[i]
+                self.validator.args.data = val_set["source"]
+                self.validator.args.split = val_set["split"]
+                result = self.validator(self)
+                if result is None:
+                    continue
+                fitness.append(result.pop("fitness", -self.loss.detach().cpu().numpy()))
+                if i == 0:
+                    metrics.update(result)
+                else:
+                    metrics.update({f"{val_set['name']}/{key}": value for key, value in result.items()})
+        finally:
+            self.data = original_data
+            self.validator.dataloader = original_loader
+            self.validator.args.data, self.validator.args.split = original_args
+
+        if not fitness:
+            return None, None
+        mean_fitness = sum(fitness) / len(fitness)
+        if not self.best_fitness or self.best_fitness < mean_fitness:
+            self.best_fitness = mean_fitness
+        return metrics, mean_fitness
 
     def plot_training_labels(self):
         """Skip label plotting for YOLO-World training."""
         pass
 
     def final_eval(self):
-        """Perform final evaluation and validation for the YOLO-World model.
+        """Validate the best checkpoint independently on every validation dataset."""
+        primary = self.validation_sets[0]
+        self.validator.dataloader = self.test_loaders[0]
+        self.validator.args.data = primary["source"]
+        self.validator.args.split = primary["split"]
+        super().final_eval()
 
-        Configures the validator with appropriate dataset and split information before running evaluation.
+        model = self.best if self.best.exists() else None
+        if model:
+            for i, val_set in enumerate(self.validation_sets[1:], 1):
+                self.validator.dataloader = self.test_loaders[i]
+                self.validator.args.data = val_set["source"]
+                self.validator.args.split = val_set["split"]
+                metrics = self.validator(model=model)
+                metrics.pop("fitness", None)
+                self.metrics.update({f"{val_set['name']}/{key}": value for key, value in metrics.items()})
 
-        Returns:
-            (dict): Dictionary containing evaluation metrics and results.
-        """
-        val = self.args.data["val"]["yolo_data"][0]
-        self.validator.args.data = val
-        self.validator.args.split = "minival" if isinstance(val, str) and "lvis" in val else "val"
-        return super().final_eval()
+        self.validator.dataloader = self.test_loaders[0]
+        self.validator.args.data = primary["source"]
+        self.validator.args.split = primary["split"]
+        return self.metrics

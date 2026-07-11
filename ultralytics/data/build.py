@@ -242,6 +242,7 @@ def build_yolo_dataset(
     stride: int = 32,
     multi_modal: bool = False,
     fraction: float | None = None,
+    max_samples: int | None = None,
 ) -> Dataset:
     """Build and return a YOLO dataset based on configuration parameters."""
     pad = 0.0 if mode == "train" else 0.5
@@ -277,6 +278,7 @@ def build_yolo_dataset(
         classes=cfg.classes,
         data=data,
         fraction=fraction,
+        **({"max_samples": max_samples} if multi_modal else {}),
     )
 
 
