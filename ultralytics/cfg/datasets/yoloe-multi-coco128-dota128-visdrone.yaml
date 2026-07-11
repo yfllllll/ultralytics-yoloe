@@ -1,0 +1,16 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# YOLOE mixed-dataset training with independent per-dataset class vocabularies.
+# Each dataset samples text prompts only from its own class pool.
+train:
+  yolo_data:
+    - coco128.yaml
+    - dota128.yaml
+    - VisDrone.yaml
+
+# Each validation dataset is evaluated independently with its own class vocabulary.
+val:
+  yolo_data:
+    - coco128.yaml
+    - dota128.yaml
+    - VisDrone.yaml
