@@ -60,7 +60,8 @@ model.train(
 
 - 内部稳定分支：`internal/yoloe-multidataset`
 - 首个已验证版本：`yoloe-multidataset-v1`
-- 官方代码远程：`origin`，指向 `ultralytics/ultralytics`
+- 内部代码远程：`origin`，指向 `yfllllll/ultralytics-yoloe`
+- 官方代码远程：`upstream`，指向 `ultralytics/ultralytics`
 
 ## 同步官方更新
 
@@ -68,8 +69,8 @@ model.train(
 
 ```bash
 cd /Users/yfliu/codes/yoloe/ultralytics-internal
-git fetch origin
-git merge origin/main
+git fetch upstream
+git merge upstream/main
 ```
 
 这会把 Ultralytics 官方更新合并到内部稳定分支，同时保留多数据集修改。如果发生冲突，Git 会停止
