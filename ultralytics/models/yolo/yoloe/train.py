@@ -69,6 +69,8 @@ class YOLOETrainer(DetectionTrainer):
             nc=self.data.get("max_text_samples", min(self.data["nc"], 80)),
             verbose=verbose and RANK == -1,
         )
+        if self.args.text_model:
+            model.set_text_model(self.args.text_model)
         if weights:
             model.load(weights)
 
@@ -125,6 +127,8 @@ class YOLOEPETrainer(DetectionTrainer):
             nc=self.data["nc"],
             verbose=verbose and RANK == -1,
         )
+        if self.args.text_model:
+            model.set_text_model(self.args.text_model)
 
         del model.model[-1].savpe
 

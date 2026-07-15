@@ -448,6 +448,66 @@ def test_yoloe_model_preserves_configured_prompt_capacity():
     assert model.model[-1].nc == 5
 
 
+def test_chinese_clip_is_frozen_and_normalizes_features(monkeypatch):
+    """Keep Chinese-CLIP outside optimization while returning normalized 512-dimensional prompt features."""
+    import transformers
+
+    from ultralytics.nn.text_model import ChineseCLIP
+
+    class Tokenizer:
+        def __call__(self, texts, **kwargs):
+            shape = (len(texts), 4)
+            return {
+                "input_ids": torch.ones(shape, dtype=torch.long),
+                "attention_mask": torch.ones(shape, dtype=torch.long),
+            }
+
+    class Encoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+
+        def get_text_features(self, input_ids, attention_mask):
+            return self.weight * input_ids[:, :1].repeat(1, 512)
+
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: Tokenizer())
+    monkeypatch.setattr(transformers.ChineseCLIPModel, "from_pretrained", lambda *args, **kwargs: Encoder())
+
+    model = ChineseCLIP("test/chinese-clip", torch.device("cpu"))
+    features = model.encode_text(model.tokenize(["安全帽", "反光背心"]))
+
+    assert features.shape == (2, 512)
+    assert torch.allclose(features.norm(dim=-1), torch.ones(2))
+    assert not model.training
+    assert not any(parameter.requires_grad for parameter in model.parameters())
+    assert not features.requires_grad
+
+
+def test_yoloe_model_switches_text_encoder_without_loading_it():
+    """Persist the selected encoder through trainer reconstruction without attaching its weights to YOLOE."""
+    from ultralytics import YOLOE
+    from ultralytics.models.yolo.yoloe.train import YOLOETrainer
+
+    wrapper = YOLOE("ultralytics/cfg/models/11/yoloe-11.yaml")
+    variant = "chineseclip:OFA-Sys/chinese-clip-vit-base-patch16"
+
+    wrapper.set_text_model(variant)
+    model = wrapper.model
+
+    assert model.text_model == variant
+    assert model.yaml["text_model"] == variant
+    assert model.clip_model is None
+    assert wrapper.overrides["text_model"] == variant
+
+    trainer = object.__new__(YOLOETrainer)
+    trainer.data = {"channels": 3, "max_text_samples": 5, "nc": 5}
+    trainer.args = SimpleNamespace(text_model=variant)
+    rebuilt = trainer.get_model(cfg=model.yaml, verbose=False)
+
+    assert rebuilt.text_model == variant
+    assert getattr(rebuilt, "clip_model", None) is None
+
+
 def test_world_trainer_applies_shared_text_limit_to_yolo_datasets(monkeypatch):
     """Apply the training/model text capacity to every YOLO child dataset without merging their vocabularies."""
     from ultralytics.models.yolo.world import train_world

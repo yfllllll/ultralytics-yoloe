@@ -265,6 +265,12 @@ class YOLOE(Model):
         assert isinstance(self.model, YOLOEModel)
         return self.model.get_text_pe(texts)
 
+    def set_text_model(self, variant: str) -> None:
+        """Select the frozen text encoder used to embed prompts."""
+        assert isinstance(self.model, YOLOEModel)
+        self.model.set_text_model(variant)
+        self.overrides["text_model"] = variant
+
     def get_visual_pe(self, img, visual):
         """Get visual positional embeddings for the given image and visual features.
 

@@ -1199,12 +1199,27 @@ class YOLOEModel(DetectionModel):
         txt_feats = [model.encode_text(token).detach() for token in text_token.split(batch)]
         txt_feats = txt_feats[0] if len(txt_feats) == 1 else torch.cat(txt_feats, dim=0)
         txt_feats = txt_feats.reshape(-1, len(text), txt_feats.shape[-1])
+        head = self.model[-1]
+        expected_dim = head.cv3[0][-1].out_channels
+        assert txt_feats.shape[-1] == expected_dim, (
+            f"Text model '{self.text_model}' produces {txt_feats.shape[-1]}-dimensional features, but the YOLOE head "
+            f"expects {expected_dim}. Select a compatible text model or change the head embedding dimension."
+        )
         if without_reprta:
             return txt_feats
 
-        head = self.model[-1]
         assert isinstance(head, YOLOEDetect)
         return head.get_tpe(txt_feats)  # run auxiliary text head
+
+    def set_text_model(self, variant: str) -> None:
+        """Select the frozen text encoder used for training, validation, and inference."""
+        supported = {"clip", "mobileclip", "mobileclip2", "chineseclip"}
+        base = variant.split(":", 1)[0]
+        if ":" not in variant or base not in supported:
+            raise ValueError(f"Invalid text model '{variant}'. Supported model families: {sorted(supported)}")
+        self.text_model = variant
+        self.yaml["text_model"] = variant
+        self.clip_model = None
 
     @smart_inference_mode()
     def get_visual_pe(self, img, visual):

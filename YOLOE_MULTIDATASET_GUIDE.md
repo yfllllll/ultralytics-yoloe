@@ -56,9 +56,87 @@ model.train(
 )
 ```
 
+## 冻结 Chinese-CLIP 训练
+
+中文实验使用 `OFA-Sys/chinese-clip-vit-base-patch16`。编码器固定为评估模式，所有参数均关闭梯度，类别
+特征在训练开始前按子数据集分别缓存，不会进入 YOLOE 优化器。
+
+```python
+from ultralytics import YOLOE
+from ultralytics.models.yolo.yoloe.train import YOLOETrainerFromScratch
+
+model = YOLOE("yoloe-11n.yaml")
+model.set_text_model("chineseclip:OFA-Sys/chinese-clip-vit-base-patch16")
+model.train(
+    data="path/to/yoloe-multidataset.yaml",
+    trainer=YOLOETrainerFromScratch,
+    epochs=100,
+    imgsz=640,
+    batch=12,
+)
+```
+
+对照实验保持数据、初始化权重、随机种子和训练参数不变，只切换文本编码器：
+
+```python
+# MobileCLIP baseline
+model.set_text_model("mobileclip:blt")
+
+# Chinese-CLIP experiment
+model.set_text_model("chineseclip:OFA-Sys/chinese-clip-vit-base-patch16")
+```
+
+Chinese-CLIP 实验应在各子数据集 YAML 中使用真实中文类别名，例如 `电瓶车`、`摩托车`、`自行车`。
+拼音 `dianpingche` 不等同于中文提示词，不适合用于评估中文编码能力。
+
+首次使用 Chinese-CLIP 需要安装 `transformers` 并下载 Hugging Face 权重。文本缓存文件名包含编码器名称，
+不会与 MobileCLIP 缓存混用。
+
+## 自动生成多数据集配置
+
+假设数据目录中包含任意层级的子目录，每个实际数据集目录都有以下结构：
+
+```text
+dataset-name/
+├── images/
+├── labels/
+└── data.yaml 或 dataset.yaml
+```
+
+递归扫描并生成配置：
+
+```bash
+python -m ultralytics.data.generate_yoloe_multidataset \
+    /path/to/datasets-root \
+    --output /path/to/yoloe-multidataset.yaml
+```
+
+严格要求所有类别名包含中文字符：
+
+```bash
+python -m ultralytics.data.generate_yoloe_multidataset \
+    /path/to/datasets-root \
+    --output /path/to/yoloe-multidataset-cn.yaml \
+    --require-chinese-names
+```
+
+生成结果会把发现的每个子数据集同时放入独立训练和独立验证列表：
+
+```yaml
+train:
+  yolo_data:
+    - /absolute/path/dataset-a/data.yaml
+    - /absolute/path/group/dataset-b/dataset.yaml
+val:
+  yolo_data:
+    - /absolute/path/dataset-a/data.yaml
+    - /absolute/path/group/dataset-b/dataset.yaml
+```
+
 ## 分支和版本
 
 - 内部稳定分支：`internal/yoloe-multidataset`
+- 中文文本编码实验分支：`codex/chinese-clip-support`
 - 首个已验证版本：`yoloe-multidataset-v1`
 - 内部代码远程：`origin`，指向 `yfllllll/ultralytics-yoloe`
 - 官方代码远程：`upstream`，指向 `ultralytics/ultralytics`

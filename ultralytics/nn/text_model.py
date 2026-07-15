@@ -335,6 +335,37 @@ class MobileCLIPTS(TextModel):
         return self.encoder(texts).to(dtype)
 
 
+class ChineseCLIP(TextModel):
+    """Encode Chinese prompts with a frozen Chinese-CLIP text tower."""
+
+    def __init__(self, model_name: str, device: torch.device) -> None:
+        """Load and freeze a Hugging Face Chinese-CLIP model."""
+        try:
+            from transformers import AutoTokenizer, ChineseCLIPModel
+        except ImportError:
+            checks.check_requirements("transformers>=4.28.0")
+            from transformers import AutoTokenizer, ChineseCLIPModel
+
+        super().__init__()
+        self.model = ChineseCLIPModel.from_pretrained(model_name).to(device).requires_grad_(False).eval()
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        text_config = getattr(getattr(self.model, "config", None), "text_config", None)
+        self.max_length = getattr(text_config, "max_position_embeddings", 512)
+        self.device = device
+        self.eval()
+
+    def tokenize(self, texts: list[str]) -> torch.Tensor:
+        """Tokenize Chinese prompts and stack input IDs with their attention masks."""
+        tokens = self.tokenizer(texts, padding=True, truncation=True, max_length=self.max_length, return_tensors="pt")
+        return torch.stack((tokens["input_ids"], tokens["attention_mask"]), dim=1).to(self.device)
+
+    @smart_inference_mode()
+    def encode_text(self, texts: torch.Tensor, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+        """Return normalized Chinese text features without updating the encoder."""
+        text_features = self.model.get_text_features(input_ids=texts[:, 0], attention_mask=texts[:, 1]).to(dtype)
+        return text_features / text_features.norm(p=2, dim=-1, keepdim=True)
+
+
 def build_text_model(variant: str, device: torch.device = None) -> TextModel:
     """Build a text encoding model based on the specified variant.
 
@@ -349,12 +380,17 @@ def build_text_model(variant: str, device: torch.device = None) -> TextModel:
         >>> model = build_text_model("clip:ViT-B/32", device=torch.device("cuda"))
         >>> model = build_text_model("mobileclip:s0", device=torch.device("cpu"))
     """
-    base, size = variant.split(":")
+    base, size = variant.split(":", 1)
     if base == "clip":
         return CLIP(size, device)
     elif base == "mobileclip":
         return MobileCLIPTS(device)
     elif base == "mobileclip2":
         return MobileCLIPTS(device, weight="mobileclip2_b.ts")
+    elif base == "chineseclip":
+        return ChineseCLIP(size, device)
     else:
-        raise ValueError(f"Unrecognized base model '{base}'. Supported models are 'clip', 'mobileclip', 'mobileclip2'.")
+        raise ValueError(
+            f"Unrecognized base model '{base}'. Supported models are 'clip', 'mobileclip', 'mobileclip2', "
+            "and 'chineseclip'."
+        )
