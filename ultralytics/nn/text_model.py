@@ -362,7 +362,8 @@ class ChineseCLIP(TextModel):
     @smart_inference_mode()
     def encode_text(self, texts: torch.Tensor, dtype: torch.dtype = torch.float32) -> torch.Tensor:
         """Return normalized Chinese text features without updating the encoder."""
-        text_features = self.model.get_text_features(input_ids=texts[:, 0], attention_mask=texts[:, 1]).to(dtype)
+        text_outputs = self.model.text_model(input_ids=texts[:, 0], attention_mask=texts[:, 1], return_dict=False)
+        text_features = self.model.text_projection(text_outputs[0][:, 0]).to(dtype)
         return text_features / text_features.norm(p=2, dim=-1, keepdim=True)
 
 

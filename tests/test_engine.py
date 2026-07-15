@@ -465,10 +465,16 @@ def test_chinese_clip_is_frozen_and_normalizes_features(monkeypatch):
     class Encoder(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.weight = torch.nn.Parameter(torch.ones(1))
+            self.text_model = TextTower()
+            self.text_projection = torch.nn.Linear(4, 512, bias=False)
 
         def get_text_features(self, input_ids, attention_mask):
-            return self.weight * input_ids[:, :1].repeat(1, 512)
+            raise AssertionError("ChineseCLIP must not depend on the version-specific get_text_features return type")
+
+    class TextTower(torch.nn.Module):
+        def forward(self, input_ids, attention_mask, return_dict):
+            hidden_state = input_ids[:, :, None].repeat(1, 1, 4).float()
+            return (hidden_state,)
 
     monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: Tokenizer())
     monkeypatch.setattr(transformers.ChineseCLIPModel, "from_pretrained", lambda *args, **kwargs: Encoder())
