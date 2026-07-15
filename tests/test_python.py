@@ -62,25 +62,42 @@ def test_dataloader_caps_workers_to_batches():
 
 
 def test_generate_yoloe_multidataset_yaml(tmp_path):
-    """Discover nested YOLO datasets, prefer data.yaml, and generate absolute train/validation sources."""
+    """Split flat nested YOLO datasets and generate complete child and aggregate configurations."""
     first = tmp_path / "group-a" / "dataset-one"
     second = tmp_path / "group-b" / "nested" / "dataset-two"
-    for root, yaml_name, names in (
-        (first, "data.yaml", {0: "电瓶车", 1: "摩托车"}),
-        (second, "dataset.yaml", ["安全帽"]),
+    for root, yaml_name, names, image_count in (
+        (first, "data.yaml", {0: "电瓶车", 1: "摩托车"}, 10),
+        (second, "dataset.yaml", ["安全帽"], 5),
     ):
         (root / "images").mkdir(parents=True)
         (root / "labels").mkdir()
-        YAML.save(root / yaml_name, {"train": "images/train", "val": "images/val", "names": names})
-    YAML.save(first / "dataset.yaml", {"train": "wrong", "val": "wrong", "names": ["wrong"]})
+        for index in range(image_count):
+            (root / "images" / f"{index}.jpg").touch()
+            (root / "labels" / f"{index}.txt").touch()
+        YAML.save(root / yaml_name, {"names": names})
+    YAML.save(first / "dataset.yaml", {"names": ["wrong"]})
     YAML.save(tmp_path / "ignored" / "data.yaml", {"names": ["ignored"]})
 
-    output, datasets = generate_multidataset_yaml(tmp_path, tmp_path / "multi.yaml", require_chinese_names=True)
+    output, datasets = generate_multidataset_yaml(
+        tmp_path, tmp_path / "multi.yaml", require_chinese_names=True, val_ratio=0.2, seed=7
+    )
     generated = YAML.load(output)
+    generated_yamls = [
+        tmp_path / "multi_datasets/group-a/dataset-one/data.yaml",
+        tmp_path / "multi_datasets/group-b/nested/dataset-two/data.yaml",
+    ]
 
     assert [dataset["yaml"] for dataset in datasets] == [first / "data.yaml", second / "dataset.yaml"]
-    assert generated["train"]["yolo_data"] == [str(first / "data.yaml"), str(second / "dataset.yaml")]
+    assert generated["train"]["yolo_data"] == [str(path) for path in generated_yamls]
     assert generated["val"] == generated["train"]
+    assert [(len(dataset["train_images"]), len(dataset["val_images"])) for dataset in datasets] == [(8, 2), (4, 1)]
+    for source, generated_yaml in zip((first, second), generated_yamls):
+        child = YAML.load(generated_yaml)
+        train_images = Path(child["train"]).read_text().splitlines()
+        val_images = Path(child["val"]).read_text().splitlines()
+        assert child["path"] == str(source)
+        assert not set(train_images) & set(val_images)
+        assert len(train_images) + len(val_images) == len(list((source / "images").glob("*.jpg")))
 
 
 def test_discover_yolo_datasets_validates_names(tmp_path):
@@ -88,13 +105,15 @@ def test_discover_yolo_datasets_validates_names(tmp_path):
     root = tmp_path / "dataset"
     (root / "images").mkdir(parents=True)
     (root / "labels").mkdir()
+    (root / "images/0.jpg").touch()
+    (root / "images/1.jpg").touch()
     yaml_path = root / "data.yaml"
-    YAML.save(yaml_path, {"train": "images/train", "val": "images/val", "names": {0: "a", 2: "b"}})
+    YAML.save(yaml_path, {"names": {0: "a", 2: "b"}})
 
     with pytest.raises(ValueError, match="contiguous"):
         discover_yolo_datasets(tmp_path)
 
-    YAML.save(yaml_path, {"train": "images/train", "val": "images/val", "names": {0: "dianpingche"}})
+    YAML.save(yaml_path, {"names": {0: "dianpingche"}})
     with pytest.raises(ValueError, match="non-Chinese"):
         discover_yolo_datasets(tmp_path, require_chinese_names=True)
 

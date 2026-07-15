@@ -5,8 +5,10 @@
 from __future__ import annotations
 
 import argparse
+import random
 from pathlib import Path
 
+from ultralytics.data.utils import IMG_FORMATS
 from ultralytics.utils import YAML
 
 DATA_YAML_NAMES = ("data.yaml", "dataset.yaml")
@@ -58,9 +60,6 @@ def discover_yolo_datasets(root: str | Path, require_chinese_names: bool = False
     datasets = []
     for dataset_root, yaml_path in sorted(candidates.items(), key=lambda item: str(item[0])):
         data = YAML.load(yaml_path)
-        missing_splits = [split for split in ("train", "val") if not data.get(split)]
-        if missing_splits:
-            raise ValueError(f"'{yaml_path}' is missing required split(s): {', '.join(missing_splits)}")
         names = _class_names(data, yaml_path)
         non_chinese = [name for name in names if not _has_chinese(name)]
         if require_chinese_names and non_chinese:
@@ -82,13 +81,69 @@ def discover_yolo_datasets(root: str | Path, require_chinese_names: bool = False
     return datasets
 
 
+def _split_images(dataset: dict, val_ratio: float, seed: int) -> tuple[list[Path], list[Path]]:
+    """Return deterministic train and validation image splits for one dataset."""
+    images_dir = dataset["root"] / "images"
+    images = sorted(
+        path.resolve() for path in images_dir.rglob("*") if path.is_file() and path.suffix[1:].lower() in IMG_FORMATS
+    )
+    if len(images) < 2:
+        raise ValueError(f"'{images_dir}' must contain at least 2 images to create separate train and val splits.")
+
+    random.Random(seed).shuffle(images)
+    val_count = min(len(images) - 1, max(1, int(len(images) * val_ratio + 0.5)))
+    return sorted(images[val_count:]), sorted(images[:val_count])
+
+
+def _write_image_list(path: Path, images: list[Path]) -> None:
+    """Write absolute image paths in Ultralytics dataset-list format."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(f"{image}\n" for image in images), encoding="utf-8")
+
+
 def generate_multidataset_yaml(
-    root: str | Path, output: str | Path, require_chinese_names: bool = False
+    root: str | Path,
+    output: str | Path,
+    require_chinese_names: bool = False,
+    val_ratio: float = 0.2,
+    seed: int = 0,
 ) -> tuple[Path, list[dict]]:
-    """Discover YOLO datasets and write a YOLOE train/validation configuration."""
-    datasets = discover_yolo_datasets(root, require_chinese_names=require_chinese_names)
-    sources = [str(dataset["yaml"]) for dataset in datasets]
+    """Discover flat YOLO datasets, split their images, and write complete per-dataset and aggregate configurations."""
+    if not 0 < val_ratio < 1:
+        raise ValueError(f"val_ratio must be between 0 and 1, but received {val_ratio}.")
+
+    root = Path(root).expanduser().resolve()
     output = Path(output).expanduser().resolve()
+    datasets = discover_yolo_datasets(root, require_chinese_names=require_chinese_names)
+    generated_root = output.parent / f"{output.stem}_datasets"
+    sources = []
+    for dataset in datasets:
+        relative_root = dataset["root"].relative_to(root)
+        generated_dir = generated_root / (relative_root if relative_root.parts else Path(dataset["root"].name))
+        train_images, val_images = _split_images(dataset, val_ratio, seed)
+        train_list, val_list = generated_dir / "train.txt", generated_dir / "val.txt"
+        generated_yaml = generated_dir / "data.yaml"
+        _write_image_list(train_list, train_images)
+        _write_image_list(val_list, val_images)
+        YAML.save(
+            generated_yaml,
+            {
+                "path": str(dataset["root"]),
+                "train": str(train_list.resolve()),
+                "val": str(val_list.resolve()),
+                "names": dict(enumerate(dataset["names"])),
+            },
+            header=f"# Generated from {dataset['yaml']} without moving image or label files.\n",
+        )
+        dataset.update(
+            {
+                "generated_yaml": generated_yaml.resolve(),
+                "train_images": train_images,
+                "val_images": val_images,
+            }
+        )
+        sources.append(str(generated_yaml.resolve()))
+
     YAML.save(
         output,
         {"train": {"yolo_data": sources}, "val": {"yolo_data": sources.copy()}},
@@ -115,17 +170,26 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Fail if any discovered class name does not contain Chinese characters.",
     )
+    parser.add_argument(
+        "--val-ratio", type=float, default=0.2, help="Fraction of each dataset assigned to validation (default: 0.2)."
+    )
+    parser.add_argument("--seed", type=int, default=0, help="Random split seed (default: 0).")
     return parser.parse_args()
 
 
 def main() -> None:
     """Generate the configuration and print a concise discovery summary."""
     args = parse_args()
-    output, datasets = generate_multidataset_yaml(args.root, args.output, args.require_chinese_names)
+    output, datasets = generate_multidataset_yaml(
+        args.root, args.output, args.require_chinese_names, val_ratio=args.val_ratio, seed=args.seed
+    )
     print(f"Generated '{output}' with {len(datasets)} dataset(s):")
     for dataset in datasets:
         warning = f"; {len(dataset['non_chinese_names'])} non-Chinese name(s)" if dataset["non_chinese_names"] else ""
-        print(f"- {dataset['yaml']} ({len(dataset['names'])} classes{warning})")
+        print(
+            f"- {dataset['generated_yaml']} ({len(dataset['names'])} classes, "
+            f"{len(dataset['train_images'])} train, {len(dataset['val_images'])} val{warning})"
+        )
 
 
 if __name__ == "__main__":

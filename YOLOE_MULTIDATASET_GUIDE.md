@@ -98,9 +98,18 @@ Chinese-CLIP 实验应在各子数据集 YAML 中使用真实中文类别名，�
 
 ```text
 dataset-name/
-├── images/
-├── labels/
+├── images/                 # 图片直接放在这里，不要求 train/val 子目录
+├── labels/                 # 与图片同名的 YOLO txt 标签
 └── data.yaml 或 dataset.yaml
+```
+
+原始 YAML 只需要类别映射，不需要 `train`、`val` 或 `path`：
+
+```yaml
+names:
+  0: 电瓶车
+  1: 摩托车
+  2: 自行车
 ```
 
 递归扫描并生成配置：
@@ -108,8 +117,13 @@ dataset-name/
 ```bash
 python -m ultralytics.data.generate_yoloe_multidataset \
     /path/to/datasets-root \
-    --output /path/to/yoloe-multidataset.yaml
+    --output /path/to/yoloe-multidataset.yaml \
+    --val-ratio 0.2 \
+    --seed 0
 ```
+
+工具对每个子数据集独立随机拆分，默认 80% 训练、20% 验证。同一随机种子会产生相同拆分。图片和标签
+不会被移动或复制；工具使用绝对图片路径生成 `train.txt` 和 `val.txt`。
 
 严格要求所有类别名包含中文字符：
 
@@ -120,18 +134,30 @@ python -m ultralytics.data.generate_yoloe_multidataset \
     --require-chinese-names
 ```
 
-生成结果会把发现的每个子数据集同时放入独立训练和独立验证列表：
+假设输出为 `/path/to/yoloe-multidataset.yaml`，工具还会创建：
+
+```text
+/path/to/yoloe-multidataset_datasets/
+└── 原始相对目录/数据集名称/
+    ├── data.yaml           # 完整的子数据集配置
+    ├── train.txt           # 训练图片绝对路径
+    └── val.txt             # 验证图片绝对路径
+```
+
+总配置引用自动生成的子数据集配置：
 
 ```yaml
 train:
   yolo_data:
-    - /absolute/path/dataset-a/data.yaml
-    - /absolute/path/group/dataset-b/dataset.yaml
+    - /path/to/yoloe-multidataset_datasets/dataset-a/data.yaml
+    - /path/to/yoloe-multidataset_datasets/group/dataset-b/data.yaml
 val:
   yolo_data:
-    - /absolute/path/dataset-a/data.yaml
-    - /absolute/path/group/dataset-b/dataset.yaml
+    - /path/to/yoloe-multidataset_datasets/dataset-a/data.yaml
+    - /path/to/yoloe-multidataset_datasets/group/dataset-b/data.yaml
 ```
+
+每个子数据集至少需要 2 张图片，才能保证训练集和验证集都不为空。
 
 ## 分支和版本
 
