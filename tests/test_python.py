@@ -61,6 +61,17 @@ def test_dataloader_caps_workers_to_batches():
         two_batches.close()
 
 
+def test_contiguous_distributed_sampler_handles_ranks_without_batches():
+    """Return empty, non-negative sample ranges when validation has fewer batches than distributed ranks."""
+    samplers = [
+        data_build.ContiguousDistributedSampler(range(31), num_replicas=8, batch_size=16, rank=rank)
+        for rank in range(8)
+    ]
+
+    assert [len(sampler) for sampler in samplers] == [16, 15, 0, 0, 0, 0, 0, 0]
+    assert [index for sampler in samplers for index in sampler] == list(range(31))
+
+
 def test_generate_yoloe_multidataset_yaml(tmp_path):
     """Split flat nested YOLO datasets and generate complete child and aggregate configurations."""
     first = tmp_path / "group-a" / "dataset-one"
