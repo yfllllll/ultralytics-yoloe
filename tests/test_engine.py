@@ -571,6 +571,55 @@ def test_world_trainer_supports_multiple_validation_datasets(monkeypatch, single
     assert [x["data"]["nc"] for x in trainer.validation_sets] == ([1, 1] if single_cls else [2, 7])
 
 
+def test_world_trainer_serializes_additional_validation_cache_builds(monkeypatch):
+    """Let rank zero finish each additional validation cache before other distributed ranks read it."""
+    from contextlib import contextmanager
+
+    from ultralytics.models.yolo.world import train_world
+
+    events = []
+
+    @contextmanager
+    def zero_first(rank):
+        events.append(("enter", rank))
+        yield
+        events.append(("exit", rank))
+
+    def build_dataset(args, path, batch, data, **kwargs):
+        assert events[-1] == ("enter", train_world.LOCAL_RANK)
+        events.append(("build", path))
+        return path
+
+    monkeypatch.setattr(train_world.WorldTrainer, "_build_train_pipeline", lambda self: None)
+    monkeypatch.setattr(train_world, "torch_distributed_zero_first", zero_first)
+    monkeypatch.setattr(train_world, "build_yolo_dataset", build_dataset)
+    monkeypatch.setattr(train_world, "build_dataloader", lambda dataset, **kwargs: f"loader:{dataset}")
+
+    trainer = object.__new__(train_world.WorldTrainerFromScratch)
+    trainer.test_loader = "loader:primary"
+    trainer.validation_sets = [
+        {"path": "primary", "data": {}},
+        {"path": "secondary", "data": {}},
+        {"path": "tertiary", "data": {}},
+    ]
+    trainer.batch_size = 16
+    trainer.world_size = 4
+    trainer.args = SimpleNamespace(task="detect", workers=0)
+    trainer.model = SimpleNamespace(stride=torch.tensor([32]))
+
+    trainer._build_train_pipeline()
+
+    assert events == [
+        ("enter", train_world.LOCAL_RANK),
+        ("build", "secondary"),
+        ("exit", train_world.LOCAL_RANK),
+        ("enter", train_world.LOCAL_RANK),
+        ("build", "tertiary"),
+        ("exit", train_world.LOCAL_RANK),
+    ]
+    assert trainer.test_loaders == ["loader:primary", "loader:secondary", "loader:tertiary"]
+
+
 def test_world_trainer_aggregates_multiple_validation_metrics():
     """Keep primary metric names, prefix secondary metrics, and average dataset fitness equally."""
     from ultralytics.models.yolo.world.train_world import WorldTrainerFromScratch

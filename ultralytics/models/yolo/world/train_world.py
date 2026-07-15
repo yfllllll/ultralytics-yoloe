@@ -11,7 +11,7 @@ from ultralytics.data.utils import check_det_dataset
 from ultralytics.models.yolo.world import WorldTrainer
 from ultralytics.utils import DATASETS_DIR, DEFAULT_CFG, LOCAL_RANK, LOGGER
 from ultralytics.utils.checks import check_file
-from ultralytics.utils.torch_utils import unwrap_model
+from ultralytics.utils.torch_utils import torch_distributed_zero_first, unwrap_model
 
 
 class WorldTrainerFromScratch(WorldTrainer):
@@ -213,15 +213,16 @@ class WorldTrainerFromScratch(WorldTrainer):
         val_batch = batch_size if self.args.task in {"obb", "semantic"} else batch_size * 2
         gs = max(int(unwrap_model(self.model).stride.max()), 32)
         for val_set in self.validation_sets[1:]:
-            dataset = build_yolo_dataset(
-                self.args,
-                val_set["path"],
-                val_batch,
-                val_set["data"],
-                mode="val",
-                rect=False,
-                stride=gs,
-            )
+            with torch_distributed_zero_first(LOCAL_RANK):
+                dataset = build_yolo_dataset(
+                    self.args,
+                    val_set["path"],
+                    val_batch,
+                    val_set["data"],
+                    mode="val",
+                    rect=False,
+                    stride=gs,
+                )
             self.test_loaders.append(
                 build_dataloader(
                     dataset,
