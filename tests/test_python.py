@@ -18,6 +18,7 @@ from PIL import Image
 
 import ultralytics.data.build as data_build
 from tests import CFG, MODEL, MODELS, SOURCE, SOURCES_LIST, TASK_MODEL_DATA
+from train_merged_yoloe_multidataset import combine_multidatasets
 from ultralytics import RTDETR, YOLO
 from ultralytics.cfg import get_cfg
 from ultralytics.data.build import build_dataloader, load_inference_source
@@ -109,6 +110,32 @@ def test_generate_yoloe_multidataset_yaml(tmp_path):
         assert child["path"] == str(source)
         assert not set(train_images) & set(val_images)
         assert len(train_images) + len(val_images) == len(list((source / "images").glob("*.jpg")))
+
+
+def test_combine_multidatasets_preserves_order_and_duplicates(tmp_path):
+    """Resolve each aggregate config independently and retain duplicate child dataset entries."""
+    first_root, second_root = tmp_path / "first", tmp_path / "second"
+    first_child, second_child = first_root / "dataset/data.yaml", second_root / "dataset/data.yaml"
+    for child in (first_child, second_child):
+        child.parent.mkdir(parents=True)
+        child.touch()
+    first_config, second_config = first_root / "multi.yaml", second_root / "multi.yaml"
+    YAML.save(
+        first_config,
+        {"train": {"yolo_data": ["dataset/data.yaml"]}, "val": {"yolo_data": ["dataset/data.yaml"]}},
+    )
+    YAML.save(
+        second_config,
+        {
+            "train": {"yolo_data": ["dataset/data.yaml", "dataset/data.yaml"]},
+            "val": {"yolo_data": ["dataset/data.yaml"]},
+        },
+    )
+
+    combined = combine_multidatasets([first_config, second_config])
+
+    assert combined["train"]["yolo_data"] == [str(first_child), str(second_child), str(second_child)]
+    assert combined["val"]["yolo_data"] == [str(first_child), str(second_child)]
 
 
 def test_discover_yolo_datasets_validates_names(tmp_path):
