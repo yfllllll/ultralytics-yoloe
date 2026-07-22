@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch.distributed as dist
 
-from ultralytics.data import YOLOConcatDataset, build_dataloader, build_grounding, build_yolo_dataset
+from ultralytics.data import YOLOConcatDataset, build_grounding, build_yolo_dataset
 from ultralytics.data.utils import check_det_dataset
 from ultralytics.models.yolo.world import WorldTrainer
 from ultralytics.utils import DATASETS_DIR, DEFAULT_CFG, LOCAL_RANK, LOGGER
 from ultralytics.utils.checks import check_file
-from ultralytics.utils.torch_utils import torch_distributed_zero_first, unwrap_model
+from ultralytics.utils.torch_utils import unwrap_model
 
 
 class WorldTrainerFromScratch(WorldTrainer):
@@ -201,37 +202,28 @@ class WorldTrainerFromScratch(WorldTrainer):
         return final_data
 
     def _build_train_pipeline(self):
-        """Build the training loader and one validation loader per validation dataset."""
+        """Build the training and primary validation loaders."""
         super()._build_train_pipeline()
-        self.test_loaders = [self.test_loader]
         if getattr(self, "validator", None) is not None:  # refresh after automatic OOM batch-size reduction
             self.validator.dataloader = self.test_loader
-        if len(self.validation_sets) == 1:
-            return
 
-        batch_size = self.batch_size // max(self.world_size, 1)
-        val_batch = batch_size if self.args.task in {"obb", "semantic"} else batch_size * 2
-        gs = max(int(unwrap_model(self.model).stride.max()), 32)
-        for val_set in self.validation_sets[1:]:
-            with torch_distributed_zero_first(LOCAL_RANK):
-                dataset = build_yolo_dataset(
-                    self.args,
-                    val_set["path"],
-                    val_batch,
-                    val_set["data"],
-                    mode="val",
-                    rect=False,
-                    stride=gs,
-                )
-            self.test_loaders.append(
-                build_dataloader(
-                    dataset,
-                    batch=val_batch,
-                    workers=self.args.workers * 2,
-                    shuffle=False,
-                    rank=LOCAL_RANK,
-                )
-            )
+    @contextmanager
+    def _validation_loader(self, index: int):
+        """Yield one validation loader and release non-primary workers immediately after use."""
+        val_set = self.validation_sets[index]
+        original_data = self.data
+        self.data = val_set["data"]
+        loader = self.test_loader if index == 0 else None
+        try:
+            if index:
+                batch_size = self.batch_size // max(self.world_size, 1)
+                val_batch = batch_size if self.args.task in {"obb", "semantic"} else batch_size * 2
+                loader = self.get_dataloader(val_set["path"], val_batch, LOCAL_RANK, mode="val")
+            yield loader
+        finally:
+            if index and loader is not None and hasattr(loader, "close"):
+                loader.close()
+            self.data = original_data
 
     def validate(self):
         """Validate each dataset with its own vocabulary and average their fitness scores."""
@@ -249,11 +241,11 @@ class WorldTrainerFromScratch(WorldTrainer):
             # Run the primary dataset last so checkpoints retain its vocabulary and metric names.
             for i in [*range(1, len(self.validation_sets)), 0]:
                 val_set = self.validation_sets[i]
-                self.data = val_set["data"]
-                self.validator.dataloader = self.test_loaders[i]
-                self.validator.args.data = val_set["source"]
-                self.validator.args.split = val_set["split"]
-                result = self.validator(self)
+                with self._validation_loader(i) as loader:
+                    self.validator.dataloader = loader
+                    self.validator.args.data = val_set["source"]
+                    self.validator.args.split = val_set["split"]
+                    result = self.validator(self)
                 if result is None:
                     continue
                 fitness.append(result.pop("fitness", -self.loss.detach().cpu().numpy()))
@@ -280,7 +272,7 @@ class WorldTrainerFromScratch(WorldTrainer):
     def final_eval(self):
         """Validate the best checkpoint independently on every validation dataset."""
         primary = self.validation_sets[0]
-        self.validator.dataloader = self.test_loaders[0]
+        self.validator.dataloader = self.test_loader
         self.validator.args.data = primary["source"]
         self.validator.args.split = primary["split"]
         super().final_eval()
@@ -288,14 +280,15 @@ class WorldTrainerFromScratch(WorldTrainer):
         model = self.best if self.best.exists() else None
         if model:
             for i, val_set in enumerate(self.validation_sets[1:], 1):
-                self.validator.dataloader = self.test_loaders[i]
-                self.validator.args.data = val_set["source"]
-                self.validator.args.split = val_set["split"]
-                metrics = self.validator(model=model)
+                with self._validation_loader(i) as loader:
+                    self.validator.dataloader = loader
+                    self.validator.args.data = val_set["source"]
+                    self.validator.args.split = val_set["split"]
+                    metrics = self.validator(model=model)
                 metrics.pop("fitness", None)
                 self.metrics.update({f"{val_set['name']}/{key}": value for key, value in metrics.items()})
 
-        self.validator.dataloader = self.test_loaders[0]
+        self.validator.dataloader = self.test_loader
         self.validator.args.data = primary["source"]
         self.validator.args.split = primary["split"]
         return self.metrics

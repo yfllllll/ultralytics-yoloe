@@ -594,75 +594,65 @@ def test_world_trainer_supports_multiple_validation_datasets(monkeypatch, single
     assert [x["data"]["nc"] for x in trainer.validation_sets] == ([1, 1] if single_cls else [2, 7])
 
 
-def test_world_trainer_serializes_additional_validation_cache_builds(monkeypatch):
-    """Let rank zero finish each additional validation cache before other distributed ranks read it."""
-    from contextlib import contextmanager
-
+def test_world_trainer_builds_only_primary_validation_loader(monkeypatch):
+    """Do not create persistent loaders for every validation dataset during training setup."""
     from ultralytics.models.yolo.world import train_world
 
-    events = []
-
-    @contextmanager
-    def zero_first(rank):
-        events.append(("enter", rank))
-        yield
-        events.append(("exit", rank))
-
-    def build_dataset(args, path, batch, data, **kwargs):
-        assert events[-1] == ("enter", train_world.LOCAL_RANK)
-        events.append(("build", path))
-        return path
-
     monkeypatch.setattr(train_world.WorldTrainer, "_build_train_pipeline", lambda self: None)
-    monkeypatch.setattr(train_world, "torch_distributed_zero_first", zero_first)
-    monkeypatch.setattr(train_world, "build_yolo_dataset", build_dataset)
-    monkeypatch.setattr(train_world, "build_dataloader", lambda dataset, **kwargs: f"loader:{dataset}")
 
     trainer = object.__new__(train_world.WorldTrainerFromScratch)
     trainer.test_loader = "loader:primary"
+    trainer.validator = SimpleNamespace(dataloader="old-loader")
     trainer.validation_sets = [
         {"path": "primary", "data": {}},
         {"path": "secondary", "data": {}},
         {"path": "tertiary", "data": {}},
     ]
-    trainer.batch_size = 16
-    trainer.world_size = 4
-    trainer.args = SimpleNamespace(task="detect", workers=0)
-    trainer.model = SimpleNamespace(stride=torch.tensor([32]))
 
     trainer._build_train_pipeline()
 
-    assert events == [
-        ("enter", train_world.LOCAL_RANK),
-        ("build", "secondary"),
-        ("exit", train_world.LOCAL_RANK),
-        ("enter", train_world.LOCAL_RANK),
-        ("build", "tertiary"),
-        ("exit", train_world.LOCAL_RANK),
-    ]
-    assert trainer.test_loaders == ["loader:primary", "loader:secondary", "loader:tertiary"]
+    assert trainer.validator.dataloader == "loader:primary"
 
 
 def test_world_trainer_aggregates_multiple_validation_metrics():
-    """Keep primary metric names, prefix secondary metrics, and average dataset fitness equally."""
+    """Validate one dataset at a time, close secondary loaders, and average dataset fitness equally."""
     from ultralytics.models.yolo.world.train_world import WorldTrainerFromScratch
+
+    events = []
+
+    class Loader:
+        def __init__(self, name):
+            self.name = name
+
+        def close(self):
+            events.append(("close", self.name))
 
     class Validator:
         def __init__(self):
             self.args = SimpleNamespace(data="original", split="val")
-            self.dataloader = "primary-loader"
+            self.dataloader = Loader("primary")
 
         def __call__(self, trainer):
+            events.append(("validate", self.dataloader.name))
             return {"metrics/mAP50-95(B)": trainer.data["score"], "fitness": trainer.data["score"]}
 
     trainer = object.__new__(WorldTrainerFromScratch)
     trainer.data = {"original": True}
     trainer.validation_sets = [
-        {"name": "primary", "source": "primary.yaml", "split": "val", "data": {"score": 0.2}},
-        {"name": "secondary", "source": "secondary.yaml", "split": "val", "data": {"score": 0.8}},
+        {"name": "primary", "source": "primary.yaml", "split": "val", "path": "primary", "data": {"score": 0.2}},
+        {
+            "name": "secondary",
+            "source": "secondary.yaml",
+            "split": "val",
+            "path": "secondary",
+            "data": {"score": 0.8},
+        },
     ]
-    trainer.test_loaders = ["primary-loader", "secondary-loader"]
     trainer.validator = Validator()
+    trainer.test_loader = trainer.validator.dataloader
+    trainer.get_dataloader = lambda path, *args, **kwargs: Loader(path)
+    trainer.args = SimpleNamespace(task="detect")
+    trainer.batch_size = 16
     trainer.ema = None
     trainer.world_size = 1
     trainer.loss = torch.tensor(1.0)
@@ -672,8 +662,9 @@ def test_world_trainer_aggregates_multiple_validation_metrics():
 
     assert metrics == {"metrics/mAP50-95(B)": 0.2, "secondary/metrics/mAP50-95(B)": 0.8}
     assert fitness == 0.5
+    assert events == [("validate", "secondary"), ("close", "secondary"), ("validate", "primary")]
     assert trainer.data == {"original": True}
-    assert trainer.validator.dataloader == "primary-loader"
+    assert trainer.validator.dataloader is trainer.test_loader
 
 
 def test_detection_loss_ignores_masked_text_slots():
