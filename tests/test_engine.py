@@ -448,6 +448,29 @@ def test_yoloe_model_preserves_configured_prompt_capacity():
     assert model.model[-1].nc == 5
 
 
+def test_yoloe_model_encodes_new_prompts_after_inference_fusion(monkeypatch):
+    """Read the stable head embedding size after inference removes the one-to-many classification branch."""
+    from ultralytics.nn import text_model
+    from ultralytics.nn.tasks import YOLOEModel
+
+    class TextModel:
+        @staticmethod
+        def tokenize(texts):
+            return torch.arange(len(texts))
+
+        @staticmethod
+        def encode_text(tokens):
+            return torch.ones(len(tokens), 512)
+
+    monkeypatch.setattr(text_model, "build_text_model", lambda *args, **kwargs: TextModel())
+    model = YOLOEModel("ultralytics/cfg/models/11/yoloe-11.yaml", verbose=False)
+    model.model[-1].cv3 = None
+
+    embeddings = model.get_text_pe(["人", "小汽车"])
+
+    assert embeddings.shape == (1, 2, 512)
+
+
 def test_chinese_clip_is_frozen_and_normalizes_features(monkeypatch):
     """Keep Chinese-CLIP outside optimization while returning normalized 512-dimensional prompt features."""
     import transformers

@@ -1200,7 +1200,7 @@ class YOLOEModel(DetectionModel):
         txt_feats = txt_feats[0] if len(txt_feats) == 1 else torch.cat(txt_feats, dim=0)
         txt_feats = txt_feats.reshape(-1, len(text), txt_feats.shape[-1])
         head = self.model[-1]
-        expected_dim = head.cv3[0][-1].out_channels
+        expected_dim = head.embed
         assert txt_feats.shape[-1] == expected_dim, (
             f"Text model '{self.text_model}' produces {txt_feats.shape[-1]}-dimensional features, but the YOLOE head "
             f"expects {expected_dim}. Select a compatible text model or change the head embedding dimension."
