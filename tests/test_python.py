@@ -23,6 +23,7 @@ from ultralytics import RTDETR, YOLO
 from ultralytics.cfg import get_cfg
 from ultralytics.data.build import build_dataloader, load_inference_source
 from ultralytics.data.generate_yoloe_multidataset import discover_yolo_datasets, generate_multidataset_yaml
+from ultralytics.data.summarize_yolo_datasets import save_summary, summarize_configs
 from ultralytics.data.utils import check_det_dataset
 from ultralytics.utils import (
     ARM64,
@@ -110,6 +111,63 @@ def test_generate_yoloe_multidataset_yaml(tmp_path):
         assert child["path"] == str(source)
         assert not set(train_images) & set(val_images)
         assert len(train_images) + len(val_images) == len(list((source / "images").glob("*.jpg")))
+
+
+def test_summarize_yoloe_multidataset_counts_local_classes(tmp_path):
+    """Aggregate exact names while counting the same physical image independently across child datasets."""
+    child_configs = []
+    for dataset_name, names, labels in (
+        (
+            "one",
+            ["人", "小汽车"],
+            {
+                "a": ["0 0.5 0.5 0.2 0.2", "0 0.4 0.4 0.1 0.1", "1 0.5 0.5 0.3 0.3"],
+                "b": ["0 0.5 0.5 0.2 0.2"],
+                "c": [],
+            },
+        ),
+        ("two", ["人", "挖掘机"], {"a": ["0 0.5 0.5 0.2 0.2", "1 0.5 0.5 0.3 0.3", "1 0.4 0.4 0.2 0.2"]}),
+    ):
+        root = tmp_path / dataset_name
+        (root / "images").mkdir(parents=True)
+        (root / "labels").mkdir()
+        image_paths = []
+        for stem, rows in labels.items():
+            image = root / "images" / f"{stem}.jpg"
+            image.touch()
+            image_paths.append(image)
+            if rows:
+                (root / "labels" / f"{stem}.txt").write_text("\n".join(rows), encoding="utf-8")
+        train = root / "train.txt"
+        val = root / "val.txt"
+        train.write_text("\n".join(str(path) for path in image_paths[:-1] or image_paths), encoding="utf-8")
+        val.write_text(str(image_paths[-1]), encoding="utf-8")
+        child = root / "data.yaml"
+        YAML.save(child, {"path": str(root), "train": str(train), "val": str(val), "names": names})
+        child_configs.append(child)
+
+    aggregate = tmp_path / "multi.yaml"
+    sources = [str(path) for path in child_configs]
+    YAML.save(aggregate, {"train": {"yolo_data": sources}, "val": {"yolo_data": sources}})
+
+    summary = summarize_configs([aggregate])
+    saved = save_summary(summary, tmp_path / "stats")
+    classes = {item["name"]: item for item in summary["classes"]}
+
+    assert summary["dataset_count"] == 2
+    assert summary["images"] == 4
+    assert summary["bboxes"] == 7
+    assert classes["人"]["bboxes"] == 4
+    assert classes["人"]["images"] == 3
+    assert classes["人"]["annotated_dataset_count"] == 2
+    assert classes["挖掘机"]["bboxes"] == 2
+    assert classes["小汽车"]["bboxes"] == 1
+    assert saved["recommended_prompts"] == ["人", "挖掘机", "小汽车"]
+    assert (tmp_path / "stats/prompts.txt").read_text(encoding="utf-8").splitlines() == [
+        "人",
+        "挖掘机",
+        "小汽车",
+    ]
 
 
 def test_combine_multidatasets_preserves_order_and_duplicates(tmp_path):
