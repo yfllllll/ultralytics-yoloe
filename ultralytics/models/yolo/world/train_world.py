@@ -158,7 +158,7 @@ class WorldTrainerFromScratch(WorldTrainer):
         assert train_data or grounding_data, "training dataset not found"
         for g in grounding_data:
             assert isinstance(g, dict), f"Grounding data should be provided in dict format, but got {type(g)}"
-            for k in {"img_path", "json_file"}:
+            for k in ("img_path", "json_file"):
                 path = Path(g[k])
                 if not path.exists() and not path.is_absolute():
                     g[k] = str((DATASETS_DIR / path).resolve())
@@ -274,7 +274,6 @@ class WorldTrainerFromScratch(WorldTrainer):
 
     def plot_training_labels(self):
         """Skip label plotting for YOLO-World training."""
-        pass
 
     def final_eval(self):
         """Validate the best checkpoint independently on every validation dataset."""
